@@ -30,17 +30,14 @@ export const Notes: React.FC = () => {
     if (!newNoteText.trim()) return;
 
     let repoId: number | null = null;
-    let repoName: string | null = null;
     if (selectedRepo !== 'none') {
       repoId = Number(selectedRepo);
-      repoName = repos.find(r => r.id === repoId)?.repoUrl.split('/').pop() || null;
     }
 
     const note = await api.notes.create({
       weekOf: weekOfStr,
       text: newNoteText,
       repoId,
-      repoName
     });
 
     setNotes([note, ...notes]);
