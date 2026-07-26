@@ -3,7 +3,7 @@ import { NavBar } from '../components/NavBar';
 import { FormInput } from '../components/FormInput';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { api } from '../services/api';
+import { api, getErrorMessage } from '../services/api';
 
 export const LogIn: React.FC = () => {
   const [email, setEmail] = useState('');
@@ -18,11 +18,11 @@ export const LogIn: React.FC = () => {
     setLoading(true);
     setError('');
     try {
-      const { user, token } = await api.auth.login(email, password);
-      login(user, token);
+      const { user, accessToken, refreshToken } = await api.auth.login(email, password);
+      login(user, accessToken, refreshToken);
       navigate('/dashboard');
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err) {
+      setError(getErrorMessage(err));
     } finally {
       setLoading(false);
     }

@@ -1,205 +1,277 @@
-import type { User, TrackedRepo, WeeklyDraft, WeeklyNote, DraftStatus, WeekStatus } from '../types';
+/**
+ * Real HTTP client for the AutoPost backend.
+ *
+ * Design decisions:
+ *  - One axios instance with a request interceptor that attaches the access
+ *    token as a Bearer header.
+ *  - A response interceptor that catches 401s, silently refreshes the access
+ *    token via POST /api/auth/refresh, then retries the original request once.
+ *  - A `refreshing` guard so that multiple concurrent 401s (e.g. several
+ *    components fetching on page load) all await the same single refresh call
+ *    rather than firing parallel refresh requests.
+ *  - On any failed refresh the user is logged out and redirected to /login.
+ *
+ * Token storage:
+ *  - access_token  → localStorage  (attached to every non-auth request)
+ *  - refresh_token → localStorage  (used only by the interceptor + explicit logout)
+ *  Known tradeoff: localStorage is readable by any script on the page (XSS risk).
+ *  An httpOnly cookie would be more secure, but that requires backend cookie support
+ *  not present in the current spec. Flag this as a known limitation for production.
+ */
 
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+import axios from 'axios';
+import type {
+  AuthResponse,
+  TrackedRepo,
+  WeeklyDraft,
+  WeeklyNote,
+} from '../types';
 
-const getStorage = <T>(key: string, defaultValue: T): T => {
-  const item = localStorage.getItem(key);
-  return item ? JSON.parse(item) : defaultValue;
-};
+// ---------------------------------------------------------------------------
+// Axios instance
+// ---------------------------------------------------------------------------
 
-const setStorage = <T>(key: string, value: T) => {
-  localStorage.setItem(key, JSON.stringify(value));
-};
+const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
 
-let currentUserId = 1;
+const client = axios.create({ baseURL: BASE_URL });
+
+// ---------------------------------------------------------------------------
+// Request interceptor — attach access token
+// ---------------------------------------------------------------------------
+
+// Endpoints that must NOT receive an access token — they either don't need
+// one (signup/login) or must not forward an expired token (refresh).
+const NO_AUTH_URLS = ['/api/auth/signup', '/api/auth/login', '/api/auth/refresh'];
+
+client.interceptors.request.use((config) => {
+  const token = localStorage.getItem('access_token');
+  const url = config.url ?? '';
+  // Attach the Bearer token to every request except the three public auth
+  // endpoints above. logout, updatePassword, and deleteAccount are protected
+  // and do need the token.
+  if (token && !NO_AUTH_URLS.some((u) => url.startsWith(u))) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// ---------------------------------------------------------------------------
+// Response interceptor — silent token refresh on 401
+// ---------------------------------------------------------------------------
+
+// Single in-flight refresh promise shared across concurrent 401s.
+let refreshing: Promise<string> | null = null;
+
+client.interceptors.response.use(
+  (res) => res,
+  async (error) => {
+    const original = error.config as typeof error.config & { _retry?: boolean };
+
+    // Spring Security returns 403 when a JWT is expired (token is parsed but
+    // rejected as invalid), and 401 when no token is present at all. We treat
+    // both the same way: attempt a silent refresh, then retry the request.
+    const status = error.response?.status;
+    if ((status === 401 || status === 403) && !original._retry) {
+      original._retry = true;
+      try {
+        // Reuse an in-flight refresh instead of firing multiple calls.
+        refreshing ??= refreshAccessToken();
+        const newToken = await refreshing;
+        refreshing = null;
+        original.headers.Authorization = `Bearer ${newToken}`;
+        return client(original);
+      } catch {
+        // Refresh failed (token expired or revoked) — wipe all auth state
+        // so AuthContext doesn't rehydrate a stale user on next page load,
+        // then redirect to login.
+        refreshing = null;
+        clearTokens();
+        localStorage.removeItem('auth_user');
+        window.location.href = '/login';
+      }
+    }
+
+    return Promise.reject(error);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Token helpers
+// ---------------------------------------------------------------------------
+
+export function saveTokens(accessToken: string, refreshToken: string): void {
+  localStorage.setItem('access_token', accessToken);
+  localStorage.setItem('refresh_token', refreshToken);
+}
+
+export function clearTokens(): void {
+  localStorage.removeItem('access_token');
+  localStorage.removeItem('refresh_token');
+}
+
+async function refreshAccessToken(): Promise<string> {
+  const refreshToken = localStorage.getItem('refresh_token');
+  // Use raw axios (not the intercepted client) to avoid triggering another 401 loop.
+  const { data } = await axios.post<AuthResponse>(
+    `${BASE_URL}/api/auth/refresh`,
+    { refreshToken }
+  );
+  saveTokens(data.accessToken, data.refreshToken);
+  return data.accessToken;
+}
+
+// ---------------------------------------------------------------------------
+// Error normalisation
+// ---------------------------------------------------------------------------
+
+/**
+ * Extracts a human-readable message from an API error response.
+ * The backend returns Spring's ProblemDetail format:
+ *   { type, title, status, detail }
+ * Fall back to the axios message if the response isn't structured.
+ */
+export function getErrorMessage(error: unknown): string {
+  if (axios.isAxiosError(error)) {
+    const detail = error.response?.data?.detail as string | undefined;
+    const message = error.response?.data?.message as string | undefined;
+    return detail ?? message ?? error.message;
+  }
+  if (error instanceof Error) return error.message;
+  return 'An unexpected error occurred.';
+}
+
+// ---------------------------------------------------------------------------
+// URL helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalises a GitHub repo URL before sending it to the backend.
+ * The spec pattern rejects a trailing slash and a .git suffix.
+ */
+export function normalizeRepoUrl(url: string): string {
+  return url.trim().replace(/\.git$/, '').replace(/\/+$/, '');
+}
+
+/** Client-side pattern that mirrors the backend's repoUrl validation. */
+const REPO_URL_PATTERN = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/;
+
+export function validateRepoUrl(url: string): string | null {
+  if (!REPO_URL_PATTERN.test(url)) {
+    return 'Enter a valid GitHub repo URL (e.g. https://github.com/username/repo-name)';
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// API surface
+// ---------------------------------------------------------------------------
 
 export const api = {
+  // ---- Auth ----------------------------------------------------------------
   auth: {
-    signup: async (email: string, _password: string):Promise<{user: User, token: string}> => {
-      await delay(500);
-      const users = getStorage<User[]>('mock_users', []);
-      if (users.find(u => u.email === email)) {
-        throw new Error('Email already in use');
-      }
-      const user: User = {
-        id: currentUserId++,
-        email,
-        createdAt: new Date().toISOString()
-      };
-      users.push(user);
-      setStorage('mock_users', users);
-      return { user, token: 'mock-jwt-token' };
+    signup: async (email: string, password: string): Promise<AuthResponse> => {
+      const { data } = await client.post<AuthResponse>('/api/auth/signup', { email, password });
+      return data;
     },
-    login: async (email: string, _password: string):Promise<{user: User, token: string}> => {
-      await delay(500);
-      const users = getStorage<User[]>('mock_users', []);
-      const user = users.find(u => u.email === email);
-      if (!user) {
-        throw new Error('Invalid email or password');
-      }
-      return { user, token: 'mock-jwt-token' };
+
+    login: async (email: string, password: string): Promise<AuthResponse> => {
+      const { data } = await client.post<AuthResponse>('/api/auth/login', { email, password });
+      return data;
     },
-    updatePassword: async () => {
-      await delay(500);
-      return true;
+
+    /** Called automatically by the response interceptor — not used directly by UI code. */
+    refresh: async (refreshToken: string): Promise<AuthResponse> => {
+      const { data } = await client.post<AuthResponse>('/api/auth/refresh', { refreshToken });
+      return data;
     },
-    deleteAccount: async (_userId: number) => {
-      await delay(500);
-      // Clean up mock data (simplified for MVP)
-      localStorage.clear();
-      return true;
-    }
+
+    /**
+     * Revokes the refresh token server-side, then the caller should clear
+     * local storage and redirect. The interceptor skip is intentional here —
+     * if the access token has already expired we still want to hit this endpoint
+     * with the refresh token to revoke it, so we pass it explicitly in the body.
+     */
+    logout: async (refreshToken: string): Promise<void> => {
+      await client.post('/api/auth/logout', { refreshToken });
+    },
+
+    updatePassword: async (currentPassword: string, newPassword: string): Promise<void> => {
+      await client.put('/api/auth/password', { currentPassword, newPassword });
+    },
+
+    /** No request body — the backend derives the user from the Bearer token. */
+    deleteAccount: async (): Promise<void> => {
+      await client.delete('/api/auth/account');
+    },
   },
+
+  // ---- Repos ---------------------------------------------------------------
   repos: {
     list: async (): Promise<TrackedRepo[]> => {
-      await delay(500);
-      return getStorage<TrackedRepo[]>('mock_repos', []);
+      const { data } = await client.get<TrackedRepo[]>('/api/repos');
+      return data;
     },
+
     add: async (repoUrl: string): Promise<TrackedRepo> => {
-      await delay(1500); // Simulate "Reading the project..."
-      if (!repoUrl.includes('github.com')) {
-        throw new Error('Couldn\'t find a public repo at that URL');
-      }
-      const repos = getStorage<TrackedRepo[]>('mock_repos', []);
-      
-      const newRepo: TrackedRepo = {
-        id: Date.now(),
-        repoUrl,
-        projectDescription: "This is an AI-generated description of the project, built by summarizing the README and codebase.",
-        lastSyncedCommitSha: null,
-        addedAt: new Date().toISOString(),
-        weeklyGrid: generateMockGrid()
-      };
-      repos.push(newRepo);
-      setStorage('mock_repos', repos);
-      
-      // Auto-generate a draft for demo purposes if none exists
-      await api.drafts.generate(newRepo.id);
-      
-      return newRepo;
+      const { data } = await client.post<TrackedRepo>('/api/repos', { repoUrl });
+      return data;
     },
+
     get: async (id: number): Promise<TrackedRepo> => {
-      await delay(300);
-      const repos = getStorage<TrackedRepo[]>('mock_repos', []);
-      const repo = repos.find(r => r.id === id);
-      if (!repo) throw new Error('Repo not found');
-      return repo;
+      const { data } = await client.get<TrackedRepo>(`/api/repos/${id}`);
+      return data;
     },
+
     updateDescription: async (id: number, description: string): Promise<void> => {
-      await delay(500);
-      const repos = getStorage<TrackedRepo[]>('mock_repos', []);
-      const idx = repos.findIndex(r => r.id === id);
-      if (idx !== -1) {
-        repos[idx].projectDescription = description;
-        setStorage('mock_repos', repos);
-      }
+      await client.put(`/api/repos/${id}/description`, { description });
     },
+
     remove: async (id: number): Promise<void> => {
-      await delay(500);
-      const repos = getStorage<TrackedRepo[]>('mock_repos', []);
-      setStorage('mock_repos', repos.filter(r => r.id !== id));
-      
-      const drafts = getStorage<WeeklyDraft[]>('mock_drafts', []);
-      setStorage('mock_drafts', drafts.filter(d => d.repoId !== id));
-    }
+      await client.delete(`/api/repos/${id}`);
+    },
   },
+
+  // ---- Drafts --------------------------------------------------------------
   drafts: {
     list: async (): Promise<WeeklyDraft[]> => {
-      await delay(500);
-      return getStorage<WeeklyDraft[]>('mock_drafts', []);
+      const { data } = await client.get<WeeklyDraft[]>('/api/drafts');
+      return data;
     },
+
     getForRepo: async (repoId: number): Promise<WeeklyDraft[]> => {
-      await delay(400);
-      const drafts = getStorage<WeeklyDraft[]>('mock_drafts', []);
-      return drafts.filter(d => d.repoId === repoId).sort((a,b) => b.weekOf.localeCompare(a.weekOf));
+      const { data } = await client.get<WeeklyDraft[]>(`/api/drafts/repo/${repoId}`);
+      return data;
     },
-    generate: async (repoId: number): Promise<WeeklyDraft> => {
-      await delay(2000); // Simulate API generation time
-      
-      const repos = getStorage<TrackedRepo[]>('mock_repos', []);
-      const repo = repos.find(r => r.id === repoId);
-      if (!repo) throw new Error('Repo not found');
-      
-      const drafts = getStorage<WeeklyDraft[]>('mock_drafts', []);
-      
-      const repoName = repo.repoUrl.split('/').pop() || 'Unknown Repo';
-      
-      // Generate Monday of current week
-      const d = new Date();
-      const day = d.getDay(), diff = d.getDate() - day + (day == 0 ? -6:1);
-      const monday = new Date(d.setDate(diff));
-      const weekOfStr = monday.toISOString().split('T')[0];
-      
-      const newDraft: WeeklyDraft = {
-        id: Date.now(),
-        repoId,
-        repoName,
-        weekOf: weekOfStr,
-        content: `This week in ${repoName}, I shipped several core features. We overhauled the backend structure to prepare for the v2 launch and cleaned up some legacy tech debt in the frontend.\n\nThe most challenging part was migrating the authentication flow without dropping active sessions, but reading through the updated docs helped tremendously.\n\n#buildinpublic #learning`,
-        status: 'DRAFT',
-        generatedAt: new Date().toISOString(),
-        commitCount: Math.floor(Math.random() * 10) + 1,
-        noteCount: 0
-      };
-      
-      drafts.push(newDraft);
-      setStorage('mock_drafts', drafts);
-      return newDraft;
-    },
+
     get: async (id: number): Promise<WeeklyDraft> => {
-      await delay(300);
-      const drafts = getStorage<WeeklyDraft[]>('mock_drafts', []);
-      const draft = drafts.find(d => d.id === id);
-      if (!draft) throw new Error('Draft not found');
-      return draft;
+      const { data } = await client.get<WeeklyDraft>(`/api/drafts/${id}`);
+      return data;
     },
-    update: async (id: number, updates: Partial<WeeklyDraft>): Promise<void> => {
-      await delay(300);
-      const drafts = getStorage<WeeklyDraft[]>('mock_drafts', []);
-      const idx = drafts.findIndex(d => d.id === id);
-      if (idx !== -1) {
-        drafts[idx] = { ...drafts[idx], ...updates };
-        setStorage('mock_drafts', drafts);
-      }
-    }
+
+    update: async (id: number, updates: { content?: string; status?: string }): Promise<void> => {
+      await client.put(`/api/drafts/${id}`, updates);
+    },
+
+    generate: async (repoId: number): Promise<WeeklyDraft> => {
+      const { data } = await client.post<WeeklyDraft>(`/api/drafts/generate/${repoId}`);
+      return data;
+    },
   },
+
+  // ---- Notes ---------------------------------------------------------------
   notes: {
     list: async (): Promise<WeeklyNote[]> => {
-      await delay(300);
-      return getStorage<WeeklyNote[]>('mock_notes', []);
+      const { data } = await client.get<WeeklyNote[]>('/api/notes');
+      return data;
     },
-    create: async (note: Omit<WeeklyNote, 'id'>): Promise<WeeklyNote> => {
-      await delay(400);
-      const notes = getStorage<WeeklyNote[]>('mock_notes', []);
-      const newNote = { ...note, id: Date.now() };
-      notes.unshift(newNote);
-      setStorage('mock_notes', notes);
-      return newNote;
-    },
-    remove: async (id: number): Promise<void> => {
-      await delay(300);
-      const notes = getStorage<WeeklyNote[]>('mock_notes', []);
-      setStorage('mock_notes', notes.filter(n => n.id !== id));
-    }
-  }
-};
 
-// Helper to generate a random 12-week grid for demo aesthetics
-function generateMockGrid(): WeekStatus[] {
-  const statuses: DraftStatus[] = ['DRAFT', 'EDITED', 'POSTED', 'SKIPPED'];
-  const grid: WeekStatus[] = [];
-  const today = new Date();
-  
-  for (let i = 11; i >= 0; i--) {
-    const d = new Date(today);
-    d.setDate(d.getDate() - (i * 7));
-    const day = d.getDay(), diff = d.getDate() - day + (day == 0 ? -6:1);
-    const monday = new Date(d.setDate(diff));
-    
-    grid.push({
-      weekOf: monday.toISOString().split('T')[0],
-      status: Math.random() > 0.3 ? statuses[Math.floor(Math.random() * statuses.length)] : 'SKIPPED'
-    });
-  }
-  return grid;
-}
+    create: async (note: { repoId?: number | null; weekOf: string; text: string }): Promise<WeeklyNote> => {
+      const { data } = await client.post<WeeklyNote>('/api/notes', note);
+      return data;
+    },
+
+    remove: async (id: number): Promise<void> => {
+      await client.delete(`/api/notes/${id}`);
+    },
+  },
+};

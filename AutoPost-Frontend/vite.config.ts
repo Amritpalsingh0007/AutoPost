@@ -8,4 +8,15 @@ export default defineConfig({
     react(),
     babel({ presets: [reactCompilerPreset()] })
   ],
+  server: {
+    proxy: {
+      // Forward all /api requests to the Spring Boot backend during local dev.
+      // This avoids CORS entirely for local development — the browser only ever
+      // talks to localhost:5173, and Vite proxies through to :8080 server-side.
+      '/api': {
+        target: 'http://localhost:8080',
+        changeOrigin: true,
+      }
+    }
+  }
 })

@@ -9,6 +9,9 @@ export const NavBar: React.FC = () => {
   const { theme, setTheme } = useTheme();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
+  const handleLogout = () => { void logout(); };
+  const handleLogoutMobile = () => { setMobileMenuOpen(false); void logout(); };
+
   const toggleTheme = () => {
     if (theme === 'light') setTheme('dark');
     else if (theme === 'dark') setTheme('system');
@@ -49,7 +52,7 @@ export const NavBar: React.FC = () => {
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--s-sm)' }}>
               <span className="t-body-sm">{user.email}</span>
-              <button onClick={logout} className="button-secondary-sm">Log out</button>
+              <button onClick={handleLogout} className="button-secondary-sm">Log out</button>
               <button onClick={toggleTheme} style={{ display: 'flex', alignItems: 'center', padding: '4px' }} title={`Theme: ${theme}`}>
                 {getThemeIcon()}
               </button>
@@ -94,7 +97,7 @@ export const NavBar: React.FC = () => {
               <Link to="/settings" className="t-body-sm" style={{ color: 'var(--c-body)' }} onClick={() => setMobileMenuOpen(false)}>Settings</Link>
               <div style={{ borderTop: '1px solid var(--c-hairline)', paddingTop: 'var(--s-sm)' }}>
                 <span className="t-body-sm" style={{ display: 'block', marginBottom: 'var(--s-sm)' }}>{user.email}</span>
-                <button onClick={() => { logout(); setMobileMenuOpen(false); }} className="button-secondary-sm">Log out</button>
+                <button onClick={handleLogoutMobile} className="button-secondary-sm">Log out</button>
               </div>
             </>
           ) : (

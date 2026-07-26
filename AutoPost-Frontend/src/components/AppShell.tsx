@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { NavBar } from './NavBar';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import type { TrackedRepo } from '../types';
-import { api } from '../services/api';
+import { api, normalizeRepoUrl, validateRepoUrl, getErrorMessage } from '../services/api';
 import { WeeklyGrid } from './WeeklyGrid';
 import { Modal } from './Modal';
 import { FormInput } from './FormInput';
@@ -17,25 +17,36 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
   const navigate = useNavigate();
 
   useEffect(() => {
-    api.repos.list().then(setRepos);
-    
+    api.repos.list().then(setRepos).catch(() => {
+      // Silently swallow — the interceptor handles auth errors globally.
+    });
+
     const handleOpenModal = () => setAddModalOpen(true);
     window.addEventListener('openAddRepoModal', handleOpenModal);
     return () => window.removeEventListener('openAddRepoModal', handleOpenModal);
-  }, [location.pathname]); // Refresh repos when navigating, useful if added in a detail view
+  }, [location.pathname]); // Refresh repos when navigating
 
   const handleAddRepo = async (e: React.FormEvent) => {
     e.preventDefault();
-    setAddLoading(true);
     setAddError('');
+
+    // Normalise before validating so users can paste URLs with .git / trailing slashes.
+    const normalised = normalizeRepoUrl(newRepoUrl);
+    const validationError = validateRepoUrl(normalised);
+    if (validationError) {
+      setAddError(validationError);
+      return;
+    }
+
+    setAddLoading(true);
     try {
-      const newRepo = await api.repos.add(newRepoUrl);
+      const newRepo = await api.repos.add(normalised);
       setRepos([...repos, newRepo]);
       setAddModalOpen(false);
       setNewRepoUrl('');
       navigate(`/repos/${newRepo.id}`);
-    } catch (err: any) {
-      setAddError(err.message);
+    } catch (err) {
+      setAddError(getErrorMessage(err));
     } finally {
       setAddLoading(false);
     }
@@ -75,14 +86,14 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
           overflowY: 'auto'
         }} className="desktop-only">
           <div style={{ fontWeight: 500 }} className="t-body-sm-strong">AutoPost</div>
-          
+
           <nav style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
             <NavItem to="/dashboard" label="Dashboard" />
             <NavItem to="/history" label="History" />
             <NavItem to="/notes" label="Notes" />
             <NavItem to="/settings" label="Settings" />
           </nav>
-          
+
           <div style={{ marginTop: 'var(--s-md)' }}>
             <div className="t-caption-mono" style={{ color: 'var(--c-hairline-strong)', marginBottom: 'var(--s-sm)' }}>TRACKED REPOS</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--s-sm)' }}>
@@ -92,9 +103,9 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
                   <WeeklyGrid weeks={r.weeklyGrid.slice(0, 6)} />
                 </Link>
               ))}
-              <button 
+              <button
                 onClick={() => setAddModalOpen(true)}
-                style={{ color: 'var(--c-link)', textAlign: 'left', marginTop: 'var(--s-sm)' }} 
+                style={{ color: 'var(--c-link)', textAlign: 'left', marginTop: 'var(--s-sm)' }}
                 className="t-body-sm"
               >
                 + Add repo
@@ -118,12 +129,12 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
         </main>
       </div>
 
-      <Modal isOpen={isAddModalOpen} onClose={() => setAddModalOpen(false)} title="Add a repository">
+      <Modal isOpen={isAddModalOpen} onClose={() => { setAddModalOpen(false); setAddError(''); setNewRepoUrl(''); }} title="Add a repository">
         <form onSubmit={handleAddRepo} style={{ display: 'flex', flexDirection: 'column', gap: 'var(--s-lg)' }}>
           <FormInput
             placeholder="https://github.com/username/repo-name"
             value={newRepoUrl}
-            onChange={e => setNewRepoUrl(e.target.value)}
+            onChange={e => { setNewRepoUrl(e.target.value); setAddError(''); }}
             error={addError}
             autoFocus
           />

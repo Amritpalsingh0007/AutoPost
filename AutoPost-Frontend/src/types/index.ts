@@ -6,6 +6,18 @@ export interface User {
   createdAt: string;
 }
 
+/**
+ * Shape returned by POST /api/auth/signup and POST /api/auth/login.
+ * The backend issues both an access token (short-lived) and a refresh token
+ * (long-lived) — the frontend stores both and uses the refresh token to
+ * silently renew the access token when it expires.
+ */
+export interface AuthResponse {
+  user: User;
+  accessToken: string;
+  refreshToken: string;
+}
+
 export interface TrackedRepo {
   id: number;
   repoUrl: string;

@@ -3,7 +3,7 @@ import { NavBar } from '../components/NavBar';
 import { FormInput } from '../components/FormInput';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { api } from '../services/api';
+import { api, getErrorMessage } from '../services/api';
 
 export const SignUp: React.FC = () => {
   const [email, setEmail] = useState('');
@@ -17,17 +17,17 @@ export const SignUp: React.FC = () => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (password !== confirmPassword) {
-      setError("Passwords do not match");
+      setError('Passwords do not match');
       return;
     }
     setLoading(true);
     setError('');
     try {
-      const { user, token } = await api.auth.signup(email, password);
-      login(user, token);
+      const { user, accessToken, refreshToken } = await api.auth.signup(email, password);
+      login(user, accessToken, refreshToken);
       navigate('/dashboard');
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err) {
+      setError(getErrorMessage(err));
     } finally {
       setLoading(false);
     }
@@ -46,15 +46,15 @@ export const SignUp: React.FC = () => {
               <p className="t-caption" style={{ color: 'var(--c-mute)', marginTop: '4px' }}>Must be at least 8 characters.</p>
             </div>
             <FormInput label="Confirm Password" type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} required />
-            
+
             {error && (
               <div className="t-caption" style={{ color: 'var(--c-error)' }}>
-                {error.includes('already in use') ? (
+                {error.toLowerCase().includes('already') ? (
                   <>That email's already in use &mdash; <Link to="/login" style={{ color: 'var(--c-error)', textDecoration: 'underline' }}>log in instead?</Link></>
                 ) : error}
               </div>
             )}
-            
+
             <button type="submit" className="button-primary" style={{ width: '100%', marginTop: 'var(--s-sm)' }} disabled={loading}>
               {loading ? 'Creating account...' : 'Create account'}
             </button>
